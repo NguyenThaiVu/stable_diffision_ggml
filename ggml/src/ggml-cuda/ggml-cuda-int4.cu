@@ -1228,3 +1228,213 @@ void quantize_f32_to_int4_row_wise_cuda(
             K
         );
 }
+
+template<int BLOCK_SIZE, int BLOCK_H>
+__global__ void block_fwht_sign_rotate_rows_kernel(
+    float * __restrict__ x,
+    int rows,
+    int K,
+    int seed1,
+    int seed2
+) {
+    const int row = blockIdx.x;
+    const int block_h_id = blockIdx.y;
+
+    if (row >= rows) {
+        return;
+    }
+
+    const int base_k = block_h_id * BLOCK_H;
+
+    if (base_k + BLOCK_H > K) {
+        return;
+    }
+
+    __shared__ float smem[BLOCK_H];
+
+    float * x_row = x + row * K;
+
+    // ------------------------------------------------------------
+    // Load one K-block + first sign flip
+    // ------------------------------------------------------------
+    for (int i = threadIdx.x; i < BLOCK_H; i += BLOCK_SIZE) {
+        const int k = base_k + i;
+
+        float v = x_row[k];
+        int s1 = spin_sign(k, seed1);
+
+        smem[i] = v * static_cast<float>(s1);
+    }
+
+    __syncthreads();
+
+    // ------------------------------------------------------------
+    // In-place FWHT inside this block
+    // ------------------------------------------------------------
+    for (int len = 1; len < BLOCK_H; len <<= 1) {
+        for (int i = threadIdx.x; i < BLOCK_H; i += BLOCK_SIZE) {
+            const int j = i ^ len;
+
+            if ((i & len) == 0) {
+                float a = smem[i];
+                float b = smem[j];
+
+                smem[i] = a + b;
+                smem[j] = a - b;
+            }
+        }
+
+        __syncthreads();
+    }
+
+    const float norm = rsqrtf(static_cast<float>(BLOCK_H));
+
+    // ------------------------------------------------------------
+    // Normalize + second sign flip + store back
+    // ------------------------------------------------------------
+    for (int i = threadIdx.x; i < BLOCK_H; i += BLOCK_SIZE) {
+        const int k = base_k + i;
+
+        int s2 = spin_sign(k, seed2);
+
+        x_row[k] = smem[i] * norm * static_cast<float>(s2);
+    }
+}
+
+bool block_fwht_sign_rotate_rows_cuda(
+    float * x,
+    int rows,
+    int K,
+    cudaStream_t stream
+) {
+    constexpr int BLOCK_SIZE = 256;
+    constexpr int BLOCK_H    = 256;
+
+    if (K % BLOCK_H != 0) {
+        return false;
+    }
+
+    const int seed1 = 1234;
+    const int seed2 = 5678;
+
+    dim3 grid(rows, K / BLOCK_H);
+    dim3 block(BLOCK_SIZE);
+
+    block_fwht_sign_rotate_rows_kernel<BLOCK_SIZE, BLOCK_H>
+        <<<grid, block, 0, stream>>>(
+            x,
+            rows,
+            K,
+            seed1,
+            seed2
+        );
+
+    return true;
+}
+
+
+template<int BLOCK_SIZE>
+__global__ void compute_incoherence_kernel(
+    const float * __restrict__ x,
+    float * __restrict__ score_out,
+    int64_t numel
+) {
+    const int tid = threadIdx.x;
+
+    __shared__ float smem_max_abs[BLOCK_SIZE];
+    __shared__ float smem_sum_sq[BLOCK_SIZE];
+
+    float local_max_abs = 0.0f;
+    float local_sum_sq  = 0.0f;
+
+    // One CUDA block scans the whole src1.
+    for (int64_t i = tid; i < numel; i += BLOCK_SIZE) {
+        float v = x[i];
+        float av = fabsf(v);
+
+        local_max_abs = fmaxf(local_max_abs, av);
+        local_sum_sq += v * v;
+    }
+
+    smem_max_abs[tid] = local_max_abs;
+    smem_sum_sq[tid]  = local_sum_sq;
+
+    __syncthreads();
+
+    for (int s = BLOCK_SIZE / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            smem_max_abs[tid] = fmaxf(smem_max_abs[tid], smem_max_abs[tid + s]);
+            smem_sum_sq[tid] += smem_sum_sq[tid + s];
+        }
+
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float max_abs = smem_max_abs[0];
+        float rms = sqrtf(smem_sum_sq[0] / (float) numel);
+        float eps = 1.0e-12f;
+
+        score_out[0] = max_abs / fmaxf(rms, eps);
+    }
+}
+
+float get_quantization_incoherent_threshold() {
+    // Default incoherent  is 10.0f
+    const char * env = std::getenv("QUANTIZATION_INCOHERENT_THRESHOLD");
+    if (env != nullptr) {
+        try {
+            float threshold = std::stof(env);
+            return threshold;
+        } catch (const std::exception & e) {    
+            fprintf(stderr, "Warning: Invalid value for QUANTIZATION_INCOHERENT_THRESHOLD: %s\n", env);
+        }
+    } 
+    return 10.0f;
+}
+
+float compute_src1_incoherence_score_cuda(
+    const float * src1_ddf_i,
+    int64_t N,
+    int64_t K,
+    cudaStream_t stream
+) {
+    constexpr int BLOCK_SIZE = 256;
+
+    const int64_t numel = N * K;
+
+    float * score_device = nullptr;
+
+    cudaError_t err = cudaMallocAsync(
+        &score_device,
+        sizeof(float),
+        stream
+    );
+    GGML_ASSERT(err == cudaSuccess);
+
+    compute_incoherence_kernel<BLOCK_SIZE>
+        <<<1, BLOCK_SIZE, 0, stream>>>(
+            src1_ddf_i,
+            score_device,
+            numel
+        );
+
+    float score_host = 0.0f;
+
+    err = cudaMemcpyAsync(
+        &score_host,
+        score_device,
+        sizeof(float),
+        cudaMemcpyDeviceToHost,
+        stream
+    );
+    GGML_ASSERT(err == cudaSuccess);
+
+    err = cudaStreamSynchronize(stream);
+    GGML_ASSERT(err == cudaSuccess);
+
+    err = cudaFreeAsync(score_device, stream);
+    GGML_ASSERT(err == cudaSuccess);
+
+    return score_host;
+}

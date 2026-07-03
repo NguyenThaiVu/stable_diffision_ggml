@@ -1936,6 +1936,7 @@ static void custom_ggml_q4_kernel(
     GGML_UNUSED_VARS(dst, src1_ddq_i, src1_padded_row_size, M);
 }
 
+
 static void custom_ggml_q4_kernel_spin(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0,
@@ -1953,6 +1954,11 @@ static void custom_ggml_q4_kernel_spin(
 ) {
     GGML_ASSERT(src0->type == GGML_TYPE_Q4_0);
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
+
+    // printf("[DEBUG]: My Custom int4 Kernel\n");
+    // print_ggml_tensor_info(src0, "src0");
+    // print_ggml_tensor_info(src1, "src1");
+    // print_ggml_tensor_info(dst, "dst");
 
     GGML_ASSERT(src0_dd_i  != nullptr);
     GGML_ASSERT(src1_ddf_i != nullptr);
@@ -1976,9 +1982,17 @@ static void custom_ggml_q4_kernel_spin(
     GGML_ASSERT(K % 2 == 0);
     GGML_ASSERT(N > 0);
 
-    const bool k_is_power_of_two = (K > 0) && ((K & (K - 1)) == 0);
+    float score = compute_src1_incoherence_score_cuda(
+        src1_ddf_i,
+        N,
+        K,
+        stream
+    );
+    printf("[DEBUG]: src1 incoherence score = %f", score);
 
-    if (!k_is_power_of_two) {
+    float threshold_q4_score = get_quantization_incoherent_threshold();
+    if (score > threshold_q4_score) {
+        printf("[DEBUG]: Using custom_ggml_q4_kernel for incoherent src1, score = %f\n", score);
         custom_ggml_q4_kernel(
             ctx,
             src0,
@@ -1996,6 +2010,30 @@ static void custom_ggml_q4_kernel_spin(
         );
         return;
     }
+
+    const int SPIN_BLOCK_H = 256;
+
+    if (K % SPIN_BLOCK_H != 0) {
+        printf("[DEBUG]: K is not divisible by SPIN_BLOCK_H, using custom_ggml_q4_kernel\n");
+        custom_ggml_q4_kernel(
+            ctx,
+            src0,
+            src1,
+            dst,
+            src0_dd_i,
+            src1_ddf_i,
+            src1_ddq_i,
+            dst_dd_i,
+            row_low,
+            row_high,
+            src1_ncols,
+            src1_padded_row_size,
+            stream
+        );
+        return;
+    }
+
+    printf("[DEBUG] Using SpinQuant rotation for Q4_0 kernel\n");
 
     int id = ggml_cuda_get_device();
 
@@ -2047,19 +2085,22 @@ static void custom_ggml_q4_kernel_spin(
     // ------------------------------------------------------------
     // Step 3: apply same orthogonal rotation to both row-wise matrices
     // ------------------------------------------------------------
-    fwht_sign_rotate_rows_cuda(
+    bool rotate_src0 = block_fwht_sign_rotate_rows_cuda(
         src0_f32.get(),
         row_diff,
         K,
         stream
     );
 
-    fwht_sign_rotate_rows_cuda(
+    bool rotate_src1 = block_fwht_sign_rotate_rows_cuda(
         src1_f32_rot.get(),
         N,
         K,
         stream
     );
+
+    GGML_ASSERT(rotate_src0);
+    GGML_ASSERT(rotate_src1);
 
     // ------------------------------------------------------------
     // Step 4: quantize rotated FP32 matrices -> packed signed INT4

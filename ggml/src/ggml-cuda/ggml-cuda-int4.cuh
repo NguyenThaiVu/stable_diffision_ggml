@@ -97,3 +97,19 @@ void quantize_f32_to_int4_row_wise_cuda(
     int K,
     cudaStream_t stream
 );
+
+bool block_fwht_sign_rotate_rows_cuda(
+    float * x,
+    int rows,
+    int K,
+    cudaStream_t stream
+);
+
+float compute_src1_incoherence_score_cuda(
+    const float * src1_ddf_i,
+    int64_t N,
+    int64_t K,
+    cudaStream_t stream
+);
+
+float get_quantization_incoherent_threshold();
