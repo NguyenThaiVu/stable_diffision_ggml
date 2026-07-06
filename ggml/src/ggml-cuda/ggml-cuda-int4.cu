@@ -1379,20 +1379,6 @@ __global__ void compute_incoherence_kernel(
     }
 }
 
-float get_quantization_incoherent_threshold() {
-    // Default incoherent  is 10.0f
-    const char * env = std::getenv("QUANTIZATION_INCOHERENT_THRESHOLD");
-    if (env != nullptr) {
-        try {
-            float threshold = std::stof(env);
-            return threshold;
-        } catch (const std::exception & e) {    
-            fprintf(stderr, "Warning: Invalid value for QUANTIZATION_INCOHERENT_THRESHOLD: %s\n", env);
-        }
-    } 
-    return 10.0f;
-}
-
 float compute_src1_incoherence_score_cuda(
     const float * src1_ddf_i,
     int64_t N,
@@ -1437,4 +1423,18 @@ float compute_src1_incoherence_score_cuda(
     GGML_ASSERT(err == cudaSuccess);
 
     return score_host;
+}
+
+float get_quantization_incoherent_threshold() {
+    // Default incoherent  is 10.0f
+    const char * env = std::getenv("QUANTIZATION_INCOHERENT_THRESHOLD");
+    if (env != nullptr) {
+        try {
+            float threshold = std::stof(env);
+            return threshold;
+        } catch (const std::exception & e) {    
+            fprintf(stderr, "Warning: Invalid value for QUANTIZATION_INCOHERENT_THRESHOLD: %s\n", env);
+        }
+    } 
+    return 10.0f;
 }

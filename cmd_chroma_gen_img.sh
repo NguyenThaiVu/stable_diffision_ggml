@@ -1,15 +1,15 @@
 GGML_USE_CUSTOM_KERNEL=1 \
-QUANTIZATION_INCOHERENT_THRESHOLD=25.0 \
+QUANTIZATION_INCOHERENT_THRESHOLD=20.0 \
 ./build/bin/sd-cli \
     --diffusion-model /scratch/tnguyen10/Diffusion/chroma-unlocked-v40-Q4_0.gguf \
     --vae /scratch/tnguyen10/Diffusion/ae.safetensors \
     --t5xxl /scratch/tnguyen10/Diffusion/t5xxl_fp16.safetensors \
-    -p "a beautiful beach with blue water, sunny day, and palm trees." \
+    -p "A stunning beach with sunshine, lounge chairs, and an umbrella." \
     --cfg-scale 4.0 \
     --sampling-method euler \
     --steps 20 \
-    --width 1024 \
-    --height 1024 \
+    --width 512 \
+    --height 512 \
     -v \
     --chroma-disable-dit-mask \
     # --clip-on-cpu
